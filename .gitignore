@@ -1,0 +1,17 @@
+# R / RStudio
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# Knitr / R Markdown caches and temporary files
+*_cache/
+*_files/
+.knitr/
+*_knit.md
+*.utf8.md
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,2252 @@
+---
+title: "Supervised Learning Project"
+subtitle: "Classification of Pulsar Candidates on the HTRU2 Dataset"
+author: "Simone Di Bella"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+library(caret)
+library(MASS)
+library(class)
+library(tree)
+library(randomForest)
+library(gbm)
+library(pROC)
+library(PRROC)
+library(corrplot)
+library(e1071)
+library(ggplot2)
+```
+
+# 1. Introduction
+
+The aim of this project is to compare a set of supervised classification methods on the HTRU2 dataset, with the objective of distinguishing pulsars from non-pulsar candidates.
+
+The methods considered are Linear Discriminant Analysis (LDA), Quadratic Discriminant Analysis (QDA), K-Nearest Neighbors (KNN), Classification Tree, Bagging, Random Forest and Gradient Boosting. The analysis is designed through the following steps: first, exploratory data analysis (EDA),  followed by a stratified train-test split, a cross-validated model selection on the training data, a model-specific threshold selection based on out-of-fold predictions, and a single final evaluation on the independent test set.
+
+The response is strongly imbalanced: pulsars represent only about 9.2% of the observations. For this reason, overall accuracy is not used as the principal measure of performance. Particular attention is given to Sensitivity, False Positive Rate (FPR), Precision, ROC and Precision-Recall AUC (PR-AUC). 
+
+A second objective is to distinguish **ranking performance** from the **operating decision rule**. Hyperparameters are selected using cross-validated PR-AUC, whereas a model-specific adjusted threshold is subsequently selected to maximize Specificity subject to a minimum training Sensitivity of 90%. The adjusted threshold is selected only from cross-validated training predictions and is frozen before the test set is examined.
+
+# 2. Dataset Description
+
+The HTRU2 dataset contains pulsar candidates obtained from the High Time Resolution Universe (HTRU) survey and was introduced for the study of automated pulsar candidate selection (Lyon et al., 2016).
+
+Pulsars are highly magnetized rotating neutron stars that emit beams of electromagnetic radiation. When one of these beams crosses the observer's line of sight, a periodic radio signal can be detected. Modern pulsar-search pipelines generate very large numbers of candidates, most of which arise from noise or radio-frequency interference rather than from genuine pulsars. Automatic classification is therefore useful for prioritizing candidates for further inspection.
+
+The dataset contains 17,898 observations: 16,259 non-pulsar candidates and 1,639 pulsars. Each observation is represented by eight numerical predictors derived from two diagnostic representations. The first four summarize the **integrated pulse profile** and the remaining four summarize the **DM-SNR curve**. For each representation, the available summaries are mean, standard deviation, excess kurtosis and skewness.
+
+The original class variable is coded as 0 for non-pulsars and 1 for pulsars. It is relabeled as `non_pulsar` and `pulsar` for interpretability.
+
+
+```{r data-loading}
+htru <- read.csv(
+  "data/HTRU_2.csv",
+  header = FALSE
+)
+
+colnames(htru) <- c(
+  "profile_mean",
+  "profile_sd",
+  "profile_kurtosis",
+  "profile_skewness",
+  "dm_mean",
+  "dm_sd",
+  "dm_kurtosis",
+  "dm_skewness",
+  "class"
+)
+
+htru$class <- factor(
+  htru$class,
+  levels = c(0, 1),
+  labels = c("non_pulsar", "pulsar")
+)
+
+dim(htru)
+```
+
+
+# 3. Exploratory Data Analysis
+
+The exploratory analysis examines class imbalance, predictor distributions, correlation structure, departures from normality and the presence of missing values. These features are relevant both for understanding the data and for interpreting the assumptions and behavior of the classification methods.
+
+## 3.1 Class Distribution
+
+The response variable is strongly imbalanced. Pulsars account for approximately 9.2% of the dataset, while non-pulsars represent the remaining 90.8%. A classifier predicting every observation as `non_pulsar` would therefore achieve high apparent accuracy while having zero ability to detect pulsars. This motivates the use of positive-class-oriented evaluation measures throughout the project.
+
+
+```{r class-distribution}
+table(htru$class)
+prop.table(table(htru$class))
+```
+
+
+## 3.2 Descriptive Statistics
+
+The predictors differ substantially in scale, variability and distributional shape. Mean, median, standard deviation, interquartile range, skewness and excess kurtosis are therefore reported for all eight numerical variables.
+
+
+```{r descriptive-statistics}
+x_vars <- names(htru)[1:8]
+
+skewness_values <- sapply(
+  htru[x_vars],
+  skewness
+)
+
+kurtosis_values <- sapply(
+  htru[x_vars],
+  kurtosis
+)
+
+eda_summary <- data.frame(
+  variable = x_vars,
+  mean = sapply(htru[x_vars], mean),
+  median = sapply(htru[x_vars], median),
+  sd = sapply(htru[x_vars], sd),
+  IQR = sapply(htru[x_vars], IQR),
+  skewness = skewness_values,
+  kurtosis = kurtosis_values
+)
+
+eda_summary_round <- eda_summary
+
+eda_summary_round[, -1] <- round(
+  eda_summary_round[, -1],
+  3
+)
+
+eda_summary_round
+```
+
+
+The descriptive statistics show marked asymmetry and heavy-tailed behavior for several predictors. In particular, the kurtosis and skewness of some variables and some DM-SNR summaries depart substantially from symmetric Gaussian behavior. Differences between means and medians provide additional evidence of skewness. These features are relevant when interpreting LDA and QDA, whose standard theoretical formulation assumes class-conditional multivariate normality.
+
+## 3.3 Correlation Structure
+
+The linear association structure is examined both globally and separately within the two classes. Class-specific correlation matrices are useful because a common pooled correlation pattern can hide differences in dependence structure between pulsars and non-pulsars.
+
+
+```{r correlation-structure}
+cor_matrix <- cor(htru[x_vars])
+
+round(cor_matrix, 2)
+
+corrplot(
+  cor_matrix,
+  method = "number",
+  type = "upper"
+)
+
+cor_non_pulsar <- cor(
+  htru[htru$class == "non_pulsar", x_vars]
+)
+
+cor_pulsar <- cor(
+  htru[htru$class == "pulsar", x_vars]
+)
+
+round(cor_non_pulsar, 2)
+round(cor_pulsar, 2)
+```
+
+
+The correlation analysis reveals strong relationships among several predictors. `profile_kurtosis` and `profile_skewness` are strongly positively associated, while `profile_mean` is negatively associated with the higher-order pulse-profile summaries. Strong associations are also present among the DM-SNR variables. 
+
+The class-specific correlation matrices reveal substantial differences in dependence structure between pulsars and non-pulsars. Within the integrated pulse-profile variables, the association between profile_kurtosis and profile_skewness is much stronger for pulsars (0.97) than for non-pulsars (0.64), while the negative relationships of profile_mean and profile_sd with the higher-order profile summaries are also generally stronger in the pulsar class. 
+
+An even clearer difference emerges in the relationships between the pulse-profile and DM-SNR variables. For non-pulsars, these cross-group correlations are mostly weak and close to zero, whereas for pulsars several become moderate or strong and often change sign. For example, the correlation between profile_mean and dm_mean changes from 0.12 in non-pulsars to -0.54 in pulsars, while the correlation between profile_kurtosis and dm_mean changes from -0.10 to 0.49. 
+
+Within the DM-SNR variables, the overall pattern of strong associations is preserved across classes, although their magnitudes also differ. Overall, these results suggest that the standardized dependence structure is not the same in the two classes, providing exploratory evidence against an identical class-specific covariance pattern.
+
+## 3.4 Distributional Analysis by Class
+
+Histograms, Q-Q plots, boxplots and a scatterplot matrix are used to compare the two classes and to inspect distributional shape, outliers and class separation.
+
+### Histograms
+
+
+```{r histograms-by-class, fig.width=12, fig.height=12}
+par(mfrow = c(4, 4))
+
+for (v in x_vars) {
+  
+  breaks_v <- pretty(
+    range(htru[[v]]),
+    n = 12
+  )
+  
+  hist(
+    htru[htru$class == "non_pulsar", v],
+    breaks = breaks_v,
+    probability = TRUE,
+    main = paste(v, "- non_pulsar"),
+    xlab = v,
+    col = "grey85"
+  )
+  
+  hist(
+    htru[htru$class == "pulsar", v],
+    breaks = breaks_v,
+    probability = TRUE,
+    main = paste(v, "- pulsar"),
+    xlab = v,
+    col = "grey70"
+  )
+}
+
+par(mfrow = c(1, 1))
+```
+
+
+The histograms show clear class differences for several predictors. Pulsars tend to have lower `profile_mean` and `profile_sd` and higher `profile_kurtosis` and `profile_skewness`. Differences are also visible in the DM-SNR variables. Several distributions are markedly asymmetric, confirming that the predictive problem is not well described by simple symmetric marginal distributions.
+
+### Q-Q plots
+
+
+```{r qqplots-by-class, fig.width=12, fig.height=12}
+par(mfrow = c(4, 4))
+
+for (v in x_vars) {
+  
+  x_notpul <- htru[htru$class == "non_pulsar", v]
+  
+  qqnorm(
+    x_notpul,
+    main = paste(v, "- non_pulsar"),
+    pch = 1,
+    cex = 0.5
+  )
+  
+  qqline(
+    x_notpul,
+    col = "red",
+    lwd = 2
+  )
+  
+  x_pul <- htru[htru$class == "pulsar", v]
+  
+  qqnorm(
+    x_pul,
+    main = paste(v, "- pulsar"),
+    pch = 1,
+    cex = 0.5
+  )
+  
+  qqline(
+    x_pul,
+    col = "red",
+    lwd = 2
+  )
+}
+
+par(mfrow = c(1, 1))
+```
+
+
+The Q-Q plots display substantial departures from normality, especially in the tails and for the skewness and kurtosis predictors. This does not prevent LDA and QDA from being useful predictive models, but it means that their distributional assumptions should be regarded as approximations rather than exact descriptions of the data.
+
+### Boxplots
+
+
+```{r boxplots-by-class, fig.width=10, fig.height=12}
+par(mfrow = c(4, 2))
+
+for (v in x_vars) {
+  
+  boxplot(
+    htru[[v]] ~ htru$class,
+    main = v,
+    xlab = "Class",
+    ylab = v
+  )
+}
+
+par(mfrow = c(1, 1))
+```
+
+
+The boxplots reinforce the distributional differences between the two classes and show numerous extreme observations. The separation in `profile_kurtosis` is particularly evident and anticipates the important role of this predictor in the subsequent models.
+
+### Scatterplot matrix
+
+
+```{r scatterplot-matrix, fig.width=12, fig.height=12}
+class_col <- ifelse(
+  htru$class == "pulsar",
+  "red",
+  "black"
+)
+
+pairs(
+  htru[x_vars],
+  col = class_col,
+  pch = 16,
+  lower.panel = NULL,
+  cex = 0.25,
+  main = "Scatterplot Matrix by Class - HTRU2"
+)
+
+par(
+  fig = c(0, 1, 0, 1),
+  new = TRUE,
+  mar = c(0, 0, 0, 0)
+)
+
+plot.new()
+
+legend(
+  "bottomleft",
+  inset = c(0.06, 0.06),
+  legend = c("non_pulsar", "pulsar"),
+  col = c("black", "red"),
+  pch = 16,
+  pt.cex = 1.6,
+  cex = 1.15,
+  bty = "n"
+)
+```
+
+
+The scatterplot matrix provides clear exploratory evidence of nonlinear dependence among several predictors. In particular, the relationships involving profile_mean, profile_kurtosis, and profile_skewness exhibit pronounced curved patterns, while several pairs of DM-SNR variables show similarly strong nonlinear associations.
+
+Class separation also appears to follow these nonlinear structures: pulsars tend to occupy specific curved regions of the predictor space rather than being separated from non-pulsars by a simple straight-line boundary. At the same time, substantial overlap remains between the two classes, and no single two-dimensional projection achieves complete separation. 
+
+These patterns suggest that purely linear decision boundaries may be restrictive and provide a strong motivation for comparing linear methods with classifiers capable of representing nonlinear interactions and decision surfaces.
+
+## 3.5 Missing Values
+
+
+```{r missing-values}
+colSums(is.na(htru))
+
+```
+
+
+No missing values are present in this dataset.
+
+# 4. Train-Test Split  Strategy
+
+## 4.1 Stratified Train-Test Split
+
+The dataset is divided into an 80% training set and a 20% independent test set using a stratified split. Stratification preserves approximately the same class prevalence in both subsets. The test set is kept untouched throughout model development and is used only after all model, hyperparameter and threshold choices have been fixed.
+
+
+```{r train-test-split}
+set.seed(123)
+
+train_index <- createDataPartition(
+  htru$class,
+  p = 0.80,
+  list = FALSE
+)
+
+train_data <- htru[train_index, ]
+test_data <- htru[-train_index, ]
+
+dim(train_data)
+dim(test_data)
+
+prop.table(table(train_data$class))
+prop.table(table(test_data$class))
+```
+
+
+The resulting sample sizes are 14,320 training observations and 3,578 test observations, with class proportions close to those in the full dataset.
+
+## 4.2 Cross-Validation
+
+A 10-fold cross-validation framework is used inside the training set. Out-of-fold (OOF) predictions are retained so that each training observation receives a prediction from a model that was not fitted using that observation.
+
+Two `caret` controls are defined. The first is used for LDA and QDA, which have no tuned hyperparameters in the current specification. The second uses a custom summary function that computes ROC-AUC, PR-AUC, Sensitivity and Specificity. For KNN, Random Forest and Gradient Boosting, `metric = "PR_AUC"` and `maximize = TRUE` are then supplied to `train()`, so PR-AUC determines hyperparameter selection.
+
+It is important to distinguish the role of `summaryFunction` from the role of `metric`: the former determines which statistics are calculated, whereas the latter determines which statistic is optimized during tuning.
+
+
+```{r cross-validation-setup}
+# Standard 10-fold CV used for models without hyperparameter tuning
+cv_control <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  savePredictions = "final"
+)
+
+
+# Custom summary function for PR-AUC based tuning
+multi_metric_summary <- function(
+    data,
+    lev = NULL,
+    model = NULL
+) {
+  
+  roc_stats <- twoClassSummary(
+    data,
+    lev = lev,
+    model = model
+  )
+  
+  positive_class <- lev[1]
+  
+  pr_object <- pr.curve(
+    scores.class0 =
+      data[[positive_class]][data$obs == positive_class],
+    scores.class1 =
+      data[[positive_class]][data$obs != positive_class],
+    curve = FALSE
+  )
+  
+  c(
+    ROC = unname(roc_stats["ROC"]),
+    PR_AUC = pr_object$auc.integral,
+    Sens = unname(roc_stats["Sens"]),
+    Spec = unname(roc_stats["Spec"])
+  )
+}
+
+
+# 10-fold CV used for KNN, Random Forest and Boosting tuning
+cv_control_multi <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = multi_metric_summary,
+  savePredictions = "final"
+)
+```
+
+
+The Classification Tree and Bagging use manual 10-fold cross-validation because their model-development procedures are handled directly through the `tree` and `randomForest` packages. The same conceptual rule is maintained: model choices and OOF predictions are generated using only the training data.
+
+## 4.3 Evaluation Measures
+
+Throughout the analysis, `pulsar` is the positive class. The main threshold-dependent quantities are
+
+$$
+Sensitivity = \frac{TP}{TP+FN},
+$$
+
+$$
+Specificity = \frac{TN}{TN+FP},
+$$
+
+$$
+FPR = 1-Specificity = \frac{FP}{FP+TN},
+$$
+
+and
+
+$$
+Precision = \frac{TP}{TP+FP}.
+$$
+
+Sensitivity measures the proportion of actual pulsars that are detected, whereas FPR quantifies the fraction of non-pulsars incorrectly flagged as pulsars. Precision measures the reliability of positive classifications.
+
+ROC-AUC and PR-AUC summarize ranking performance over all possible thresholds. ROC-AUC describes discrimination in terms of Sensitivity and FPR, while PR-AUC summarizes the Precision-Recall trade-off. Because pulsars are rare, PR-AUC is used as the primary tuning criterion for models with hyperparameters.
+
+# 5. Classification Models
+
+For each model, the training-set analysis produces OOF class predictions and OOF pulsar probabilities. Hard classifications are used for Sensitivity, FPR and Precision, while probability scores are used for ROC-AUC and PR-AUC. Model-specific tuning is performed without accessing the independent test set.
+
+## 5.1 Linear Discriminant Analysis
+
+LDA assumes class-conditional multivariate normal distributions with a common covariance matrix,
+
+$$
+X \mid Y=k \sim N_p(\mu_k,\Sigma),
+$$
+
+which yields a linear decision boundary. No hyperparameter is tuned in the present specification, but the model is still evaluated by 10-fold OOF predictions, including PR-AUC.
+
+
+```{r lda-model}
+set.seed(123)
+
+lda_model <- train(
+  class ~ .,
+  data = train_data,
+  method = "lda",
+  trControl = cv_control
+)
+```
+```{r lda-performance}
+lda_cv_pred <- data.frame(
+  obs = lda_model$pred$obs,
+  pred = lda_model$pred$pred,
+  pulsar = lda_model$pred$pulsar
+)
+
+cm_lda_cv <- confusionMatrix(
+  data = lda_cv_pred$pred,
+  reference = lda_cv_pred$obs,
+  positive = "pulsar"
+)
+
+roc_lda_cv <- roc(
+  response = lda_cv_pred$obs,
+  predictor = lda_cv_pred$pulsar,
+  levels = c("non_pulsar", "pulsar"),
+  direction = "<",
+  quiet = TRUE
+)
+
+pr_lda_cv <- pr.curve(
+  scores.class0 =
+    lda_cv_pred$pulsar[lda_cv_pred$obs == "pulsar"],
+  scores.class1 =
+    lda_cv_pred$pulsar[lda_cv_pred$obs == "non_pulsar"],
+  curve = TRUE
+)
+
+lda_results <- data.frame(
+  Sensitivity = cm_lda_cv$byClass["Sensitivity"],
+  FPR = 1 - cm_lda_cv$byClass["Specificity"],
+  Precision = cm_lda_cv$byClass["Pos Pred Value"],
+  ROC_AUC = as.numeric(auc(roc_lda_cv)),
+  PR_AUC = pr_lda_cv$auc.integral
+)
+
+```
+
+```{r lda-results-table, echo=FALSE}
+lda_table <- data.frame(
+  Metric = c(
+    "Sensitivity",
+    "FPR",
+    "Precision",
+    "ROC-AUC",
+    "PR-AUC"
+  ),
+  Value = round(as.numeric(lda_results[1, ]), 4)
+)
+
+knitr::kable(
+  lda_table,
+  row.names = FALSE,
+  caption = "LDA out-of-fold performance"
+)
+
+```
+
+
+
+
+LDA provides strong ranking performance despite its relatively simple linear decision rule and the departures from Gaussian assumptions observed in the exploratory analysis. Its standard hard-classification rule is comparatively conservative: it maintains a low false-positive rate and high positive-prediction reliability, but this comes at the cost of lower Sensitivity. The contrast between the ranking metrics and the threshold-dependent metrics suggests that the model orders pulsar candidates effectively even though its standard operating point does not prioritize high recall. This distinction will become important in the subsequent threshold-adjustment analysis.
+
+## 5.2 Quadratic Discriminant Analysis
+
+QDA relaxes the common-covariance assumption and estimates a separate covariance matrix for each class,
+
+$$
+X \mid Y=k \sim N_p(\mu_k,\Sigma_k),
+$$
+
+allowing a quadratic decision boundary. As for LDA, there are no tuned hyperparameters in the current specification, but OOF probabilities are used to compute ranking measures and to select the later adjusted threshold.
+
+
+```{r qda-model}
+set.seed(123)
+
+qda_model <- train(
+  class ~ .,
+  data = train_data,
+  method = "qda",
+  trControl = cv_control
+)
+```
+```{r qda-performance}
+qda_cv_pred <- data.frame(
+  obs = qda_model$pred$obs,
+  pred = qda_model$pred$pred,
+  pulsar = qda_model$pred$pulsar
+)
+
+cm_qda_cv <- confusionMatrix(
+  data = qda_cv_pred$pred,
+  reference = qda_cv_pred$obs,
+  positive = "pulsar"
+)
+
+roc_qda_cv <- roc(
+  response = qda_cv_pred$obs,
+  predictor = qda_cv_pred$pulsar,
+  levels = c("non_pulsar", "pulsar"),
+  direction = "<",
+  quiet = TRUE
+)
+
+pr_qda_cv <- pr.curve(
+  scores.class0 =
+    qda_cv_pred$pulsar[qda_cv_pred$obs == "pulsar"],
+  scores.class1 =
+    qda_cv_pred$pulsar[qda_cv_pred$obs == "non_pulsar"],
+  curve = TRUE
+)
+
+qda_results <- data.frame(
+  Sensitivity = cm_qda_cv$byClass["Sensitivity"],
+  FPR = 1 - cm_qda_cv$byClass["Specificity"],
+  Precision = cm_qda_cv$byClass["Pos Pred Value"],
+  ROC_AUC = as.numeric(auc(roc_qda_cv)),
+  PR_AUC = pr_qda_cv$auc.integral
+)
+
+```
+
+```{r qda-results-table, echo=FALSE}
+qda_table <- data.frame(
+  Metric = c(
+    "Sensitivity",
+    "FPR",
+    "Precision",
+    "ROC-AUC",
+    "PR-AUC"
+  ),
+  Value = round(as.numeric(qda_results[1, ]), 4)
+)
+
+knitr::kable(
+  qda_table,
+  row.names = FALSE,
+  caption = "QDA out-of-fold performance"
+)
+
+```
+QDA achieves a higher Sensitivity (0.8567) than LDA, indicating that its standard classification rule identifies a larger proportion of pulsars. However, this gain is accompanied by a higher false-positive rate (0.0218) and a substantially lower Precision (0.7989). Its ranking performance is also weaker, with ROC-AUC = 0.9649 and PR-AUC = 0.8898. Thus, allowing class-specific covariance matrices increases flexibility and improves recall under the standard decision rule, but does not translate into better overall discrimination. In this case, the additional flexibility of QDA appears to come at the cost of both false-positive control and ranking quality.
+
+
+## 5.3 K-Nearest Neighbors
+
+KNN classifies an observation using the classes of its nearest neighbors. Since the method is distance-based, all predictors are centered and scaled inside the `caret` preprocessing pipeline. Candidate values are the odd integers from 1 to 31, reducing the possibility of ties in binary voting.
+
+The number of neighbors is selected by maximizing 10-fold cross-validated PR-AUC:
+
+$$
+k^* = \arg\max_k PR\text{-}AUC_{CV}(k).
+$$
+
+
+```{r knn-tuning, fig.height=5, fig.width=8, cache=TRUE}
+train_knn <- train_data
+
+train_knn$class <- relevel(
+  train_knn$class,
+  ref = "pulsar"
+)
+
+knn_grid <- expand.grid(
+  k = seq(1, 31, by = 2)
+)
+
+set.seed(123)
+
+knn_tuning <- train(
+  class ~ .,
+  data = train_knn,
+  method = "knn",
+  preProcess = c("center", "scale"),
+  tuneGrid = knn_grid,
+  trControl = cv_control_multi,
+  metric = "PR_AUC",
+  maximize = TRUE
+)
+
+plot(knn_tuning)
+
+# Full cross-validated tuning results
+knn_tuning$results
+
+selected_k <- knn_tuning$bestTune$k
+selected_k
+```
+
+
+The selected value is **$k=29$**. The tuning profile is relatively flat for larger values of $k$, with a broad plateau approximately between 23 and 31. Thus, the selected value should be interpreted as the maximum within a region of very similar cross-validated performance rather than as an isolated optimum.
+
+
+```{r knn-performance}
+knn_cv_pred <- data.frame(
+  obs = knn_tuning$pred$obs,
+  pred = knn_tuning$pred$pred,
+  pulsar = knn_tuning$pred$pulsar
+)
+
+cm_knn_cv <- confusionMatrix(
+  data = knn_cv_pred$pred,
+  reference = knn_cv_pred$obs,
+  positive = "pulsar"
+)
+
+roc_knn_cv <- roc(
+  response = knn_cv_pred$obs,
+  predictor = knn_cv_pred$pulsar,
+  levels = c("non_pulsar", "pulsar"),
+  direction = "<",
+  quiet = TRUE
+)
+
+pr_knn_cv <- pr.curve(
+  scores.class0 =
+    knn_cv_pred$pulsar[knn_cv_pred$obs == "pulsar"],
+  scores.class1 =
+    knn_cv_pred$pulsar[knn_cv_pred$obs == "non_pulsar"],
+  curve = TRUE
+)
+
+knn_results <- data.frame(
+  Sensitivity = cm_knn_cv$byClass["Sensitivity"],
+  FPR = 1 - cm_knn_cv$byClass["Specificity"],
+  Precision = cm_knn_cv$byClass["Pos Pred Value"],
+  ROC_AUC = as.numeric(auc(roc_knn_cv)),
+  PR_AUC = pr_knn_cv$auc.integral
+)
+
+```
+
+
+```{r knn-results-table, echo=FALSE}
+knn_table <- data.frame(
+  Metric = c(
+    "Sensitivity",
+    "FPR",
+    "Precision",
+    "ROC-AUC",
+    "PR-AUC"
+  ),
+  Value = round(as.numeric(knn_results[1, ]), 4)
+)
+
+knitr::kable(
+  knn_table,
+  row.names = FALSE,
+  caption = paste0(
+    "KNN (k = ", selected_k, ") out-of-fold performance"
+  )
+)
+```
+
+The selected KNN model achieves a Sensitivity of 0.8056 while maintaining a very low false-positive rate of 0.0047 and a high Precision of 0.9454. The ROC-AUC of 0.9646 and PR-AUC of 0.9157 indicate strong ranking ability, although the ranking performance remains below that of LDA. Compared with QDA, KNN sacrifices some Sensitivity but provides substantially better false-positive control, Precision and PR-AUC. Overall, the selected value of \(k\) produces a relatively conservative classifier that identifies pulsar candidates with high reliability while retaining strong discrimination.
+
+
+## 5.4 Classification Tree
+
+A standard classification tree is first grown on the complete training set using the `tree` package. Tree construction follows the package's standard deviance-based procedure.
+
+
+```{r classification-tree, fig.width=8, fig.height=6}
+tree_model <- tree(
+  class ~ .,
+  data = train_data
+)
+
+# Inspect the initial tree
+tree_model
+summary(tree_model)
+
+plot(tree_model)
+
+text(
+  tree_model,
+  pretty = 0,
+  cex = 0.7
+)
+```
+
+
+The initial tree reveals a remarkably compact structure, relying on only two of the eight predictors. The first and most influential split is based on profile_kurtosis, which separates observations with lower values from those with higher values and largely determines the final class assignment. Within the lower-kurtosis region, profile_kurtosis is used again to create a more refined partition, while dm_sd provides an additional subdivision of observations that remain predominantly classified as non-pulsars.
+
+On the higher-kurtosis side, a further split on profile_kurtosis separates two regions that are both predominantly associated with the pulsar class. Thus, profile_kurtosis provides the main discriminatory structure of the tree, whereas dm_sd plays a secondary refining role.
+
+Although several terminal nodes share the same majority class label, they should not be interpreted as redundant. Each leaf represents a distinct region of the predictor space and may correspond to a different estimated pulsar probability.
+
+
+
+### Tree-size selection by cross-validated PR-AUC
+
+The standard tree pruning path provides candidate subtree sizes, generated using the deviance-based pruning criterion, while cross-validated PR-AUC is used externally to select the final tree size.
+
+For each candidate size, a manual 10-fold CV is performed. A tree is grown on nine folds, pruned to the candidate size, probabilities are predicted on the held-out fold, and PR-AUC is computed. The mean PR-AUC across the ten folds is then used for model selection.
+
+
+```{r tree-size-selection, cache=TRUE}
+# Available subtree sizes from the standard tree
+tree_sizes <- sort(
+  prune.tree(tree_model)$size
+)
+
+tree_sizes
+
+
+set.seed(123)
+
+tree_folds <- createFolds(
+  train_data$class,
+  k = 10,
+  list = TRUE,
+  returnTrain = FALSE
+)
+
+tree_cv_results <- data.frame(
+  Size = tree_sizes,
+  PR_AUC = NA_real_
+)
+
+
+for (size_i in tree_sizes) {
+  
+  fold_pr <- numeric(10)
+  
+  
+  for (i in seq_along(tree_folds)) {
+    
+    validation_index <- tree_folds[[i]]
+    
+    fold_train <- train_data[-validation_index, ]
+    fold_valid <- train_data[validation_index, ]
+    
+    
+    # Grow the standard classification tree
+    fold_tree <- tree(
+      class ~ .,
+      data = fold_train
+    )
+    
+    
+    # Root-only tree
+    if (size_i == 1) {
+      
+      fold_prob <- rep(
+        mean(fold_train$class == "pulsar"),
+        nrow(fold_valid)
+      )
+      
+    } else {
+      
+      fold_tree_pruned <- prune.tree(
+        fold_tree,
+        best = size_i
+      )
+      
+      fold_prob <- predict(
+        fold_tree_pruned,
+        newdata = fold_valid,
+        type = "vector"
+      )[, "pulsar"]
+    }
+    
+    
+    # PR-AUC
+    fold_pr[i] <- pr.curve(
+      scores.class0 =
+        fold_prob[fold_valid$class == "pulsar"],
+      scores.class1 =
+        fold_prob[fold_valid$class == "non_pulsar"],
+      curve = FALSE
+    )$auc.integral
+  }
+  
+  
+  tree_cv_results$PR_AUC[
+    tree_cv_results$Size == size_i
+  ] <- mean(fold_pr)
+}
+
+
+# Cross-validated PR-AUC by tree size
+tree_cv_results
+
+
+# Select the tree size with the highest PR-AUC
+selected_tree_size <- tree_cv_results$Size[
+  which.max(tree_cv_results$PR_AUC)
+]
+
+selected_tree_size
+```
+
+
+The candidate sizes are 1 through 5 terminal nodes. Their approximate mean PR-AUC values are 0.0916, 0.7957, 0.8223, 0.8475 and 0.8929, respectively. The highest value is therefore obtained with **five terminal nodes**. Because the original standard tree already has five leaves, the selected final tree is effectively the unpruned five-leaf tree.
+
+```{r final-classification-tree, fig.width=8, fig.height=6}
+tree_final <- prune.tree(
+  tree_model,
+  best = selected_tree_size
+)
+```
+
+
+After the final tree size is fixed, a second fold-wise fitting loop generates one OOF class prediction and one OOF pulsar probability for every training observation. These predictions are used for performance estimation and later threshold selection.
+
+
+```{r tree-performance, cache=TRUE}
+tree_cv_pred <- data.frame(
+  obs = factor(
+    rep(NA, nrow(train_data)),
+    levels = levels(train_data$class)
+  ),
+  pred = factor(
+    rep(NA, nrow(train_data)),
+    levels = levels(train_data$class)
+  ),
+  pulsar = rep(
+    NA_real_,
+    nrow(train_data)
+  )
+)
+
+
+for (i in seq_along(tree_folds)) {
+  
+  validation_index <- tree_folds[[i]]
+  
+  fold_train <- train_data[-validation_index, ]
+  fold_valid <- train_data[validation_index, ]
+  
+  tree_fold <- tree(
+    class ~ .,
+    data = fold_train
+  )
+  
+  tree_fold_final <- prune.tree(
+    tree_fold,
+    best = selected_tree_size
+  )
+  
+  tree_cv_pred$obs[validation_index] <- fold_valid$class
+  
+  tree_cv_pred$pred[validation_index] <- predict(
+    tree_fold_final,
+    newdata = fold_valid,
+    type = "class"
+  )
+  
+  tree_cv_pred$pulsar[validation_index] <- predict(
+    tree_fold_final,
+    newdata = fold_valid,
+    type = "vector"
+  )[, "pulsar"]
+}
+
+
+cm_tree_cv <- confusionMatrix(
+  data = tree_cv_pred$pred,
+  reference = tree_cv_pred$obs,
+  positive = "pulsar"
+)
+
+roc_tree_cv <- roc(
+  response = tree_cv_pred$obs,
+  predictor = tree_cv_pred$pulsar,
+  levels = c("non_pulsar", "pulsar"),
+  direction = "<",
+  quiet = TRUE
+)
+
+pr_tree_cv <- pr.curve(
+  scores.class0 =
+    tree_cv_pred$pulsar[tree_cv_pred$obs == "pulsar"],
+  scores.class1 =
+    tree_cv_pred$pulsar[tree_cv_pred$obs == "non_pulsar"],
+  curve = TRUE
+)
+
+tree_results <- data.frame(
+  Sensitivity = cm_tree_cv$byClass["Sensitivity"],
+  FPR = 1 - cm_tree_cv$byClass["Specificity"],
+  Precision = cm_tree_cv$byClass["Pos Pred Value"],
+  ROC_AUC = as.numeric(auc(roc_tree_cv)),
+  PR_AUC = pr_tree_cv$auc.integral
+)
+
+```
+
+```{r tree-results-table, echo=FALSE}
+tree_table <- data.frame(
+  Metric = c(
+    "Sensitivity",
+    "FPR",
+    "Precision",
+    "ROC-AUC",
+    "PR-AUC"
+  ),
+  Value = round(as.numeric(tree_results[1, ]), 4)
+)
+
+knitr::kable(
+  tree_table,
+  row.names = FALSE,
+  caption = paste0(
+    "Classification Tree (",
+    selected_tree_size,
+    " terminal nodes) out-of-fold performance"
+  )
+)
+
+```
+The selected five-terminal-node Classification Tree achieves a Sensitivity of 0.8361, with a relatively low FPR of 0.0085 and a Precision of 0.9081. Its ROC-AUC of 0.9676 indicates good overall discrimination, while the PR-AUC of 0.8911 is lower than that obtained by LDA and KNN and only slightly higher than that of QDA. The tree therefore provides a relatively interpretable decision structure with good hard-classification performance, but its probability ranking is less effective than that of the strongest models considered so far. The fact that cross-validation retains all five terminal nodes suggests that the additional partitions contribute useful ranking information, even though several leaves share the same majority class label.
+
+## 5.5 Bagging
+
+Bagging is implemented through `randomForest()` with $mtry=p=8$, so all eight predictors are eligible at every split. Five hundred bootstrap trees are used. There is no model-selection grid for Bagging in this project; instead, manual 10-fold CV is used to obtain OOF predictions and estimate training performance.
+
+
+```{r bagging-setup, cache=TRUE}
+train_bag <- train_data
+
+train_bag$class <- relevel(
+  train_bag$class,
+  ref = "pulsar"
+)
+```
+
+
+
+```{r bagging-performance, cache=TRUE}
+set.seed(123)
+
+bag_folds <- createFolds(
+  train_bag$class,
+  k = 10,
+  list = TRUE,
+  returnTrain = FALSE
+)
+
+bag_cv_pred <- data.frame(
+  obs = factor(
+    rep(NA, nrow(train_bag)),
+    levels = levels(train_bag$class)
+  ),
+  pred = factor(
+    rep(NA, nrow(train_bag)),
+    levels = levels(train_bag$class)
+  ),
+  pulsar = rep(
+    NA_real_,
+    nrow(train_bag)
+  )
+)
+
+for (i in seq_along(bag_folds)) {
+
+  validation_index <- bag_folds[[i]]
+
+  fold_train <- train_bag[-validation_index, ]
+  fold_valid <- train_bag[validation_index, ]
+
+  bag_fold <- randomForest(
+    class ~ .,
+    data = fold_train,
+    mtry = 8,
+    ntree = 500
+  )
+
+  bag_cv_pred$obs[validation_index] <- fold_valid$class
+
+  bag_cv_pred$pred[validation_index] <- predict(
+    bag_fold,
+    newdata = fold_valid,
+    type = "response"
+  )
+
+  bag_cv_pred$pulsar[validation_index] <- predict(
+    bag_fold,
+    newdata = fold_valid,
+    type = "prob"
+  )[, "pulsar"]
+}
+
+cm_bag_cv <- confusionMatrix(
+  data = bag_cv_pred$pred,
+  reference = bag_cv_pred$obs,
+  positive = "pulsar"
+)
+
+roc_bag_cv <- roc(
+  response = bag_cv_pred$obs,
+  predictor = bag_cv_pred$pulsar,
+  levels = c("non_pulsar", "pulsar"),
+  direction = "<",
+  quiet = TRUE
+)
+
+pr_bag_cv <- pr.curve(
+  scores.class0 =
+    bag_cv_pred$pulsar[bag_cv_pred$obs == "pulsar"],
+  scores.class1 =
+    bag_cv_pred$pulsar[bag_cv_pred$obs == "non_pulsar"],
+  curve = TRUE
+)
+
+bag_results <- data.frame(
+  Sensitivity = cm_bag_cv$byClass["Sensitivity"],
+  FPR = 1 - cm_bag_cv$byClass["Specificity"],
+  Precision = cm_bag_cv$byClass["Pos Pred Value"],
+  ROC_AUC = as.numeric(auc(roc_bag_cv)),
+  PR_AUC = pr_bag_cv$auc.integral
+)
+
+```
+
+
+```{r bagging-results-table, echo=FALSE}
+bag_table <- data.frame(
+  Metric = c(
+    "Sensitivity",
+    "FPR",
+    "Precision",
+    "ROC-AUC",
+    "PR-AUC"
+  ),
+  Value = round(as.numeric(bag_results[1, ]), 4)
+)
+
+knitr::kable(
+  bag_table,
+  row.names = FALSE,
+  caption = "Bagging out-of-fold performance"
+)
+```
+
+The Bagging model achieves a Sensitivity of 0.8415, with a low FPR of 0.0068 and a high Precision of 0.9262. Its ROC-AUC of 0.9715 and PR-AUC of 0.9231 indicate strong ranking performance. Compared with the single Classification Tree, Bagging preserves a similar level of Sensitivity while improving false-positive control, Precision and both ranking metrics. This improvement is consistent with the variance-reduction effect obtained by averaging predictions across many bootstrap trees. Overall, Bagging provides a more stable and effective classifier than the individual tree while retaining strong discrimination between pulsars and non-pulsars.
+
+
+These OOF results describe the internal cross-validated performance of the Bagging procedure. After this evaluation step, a final Bagging model is fitted on the complete training set. The distinction is important: the fold-specific models are temporary objects used only to generate OOF predictions, whereas the final model is trained using all available training observations and is subsequently applied to the independent test set.
+
+
+```{r bagging-final-model, fig.width=8, fig.height=6, cache=TRUE}
+set.seed(123)
+
+bag_model <- randomForest(
+  class ~ .,
+  data = train_bag,
+  mtry = 8,
+  ntree = 500,
+  importance = TRUE
+)
+
+# Numeric variable-importance measures
+importance(bag_model)
+
+varImpPlot(
+  bag_model,
+  main = "Variable Importance - Bagging"
+)
+```
+
+
+The variable-importance analysis is used for interpretation rather than feature selection. It indicates which predictors contribute most strongly to the ensemble's predictive decisions.
+
+Both importance measures identify `profile_kurtosis` as the dominant predictor, while the remaining variables make substantially smaller contributions. Dispersion-related summaries such as `dm_sd` nevertheless provide additional predictive information.
+
+## 5.6 Random Forest
+
+Random Forest differs from Bagging by considering only a random subset of predictors at each split. The number of candidate predictors, `mtry`, is tuned over values from 1 to 8. The tuning criterion is 10-fold cross-validated PR-AUC.
+
+
+```{r rf-tuning, fig.width=8, fig.height=5, cache=TRUE}
+train_rf <- train_data
+
+train_rf$class <- relevel(
+  train_rf$class,
+  ref = "pulsar"
+)
+
+rf_grid <- expand.grid(
+  mtry = 1:8
+)
+
+set.seed(123)
+
+rf_model <- train(
+  class ~ .,
+  data = train_rf,
+  method = "rf",
+  tuneGrid = rf_grid,
+  trControl = cv_control_multi,
+  metric = "PR_AUC",
+  maximize = TRUE,
+  ntree = 500,
+  importance = TRUE
+)
+
+plot(rf_model)
+
+# Full cross-validated tuning results
+rf_model$results
+
+# Best mtry selected by PR-AUC
+selected_mtry <- rf_model$bestTune$mtry
+selected_mtry
+```
+
+
+The selected value is **$mtry=2$**. The final `caret` model automatically retains this configuration and refits it on the complete training set.
+
+Although \(mtry=2\) gives the highest mean cross-validated PR-AUC, nearby values yield very similar performance relative to the variability across folds. The selected value should therefore be interpreted as the empirical optimum within the evaluated grid rather than as a sharply dominant configuration.
+
+
+```{r rf-performance}
+rf_cv_pred <- data.frame(
+  obs = rf_model$pred$obs,
+  pred = rf_model$pred$pred,
+  pulsar = rf_model$pred$pulsar
+)
+
+cm_rf_cv <- confusionMatrix(
+  data = rf_cv_pred$pred,
+  reference = rf_cv_pred$obs,
+  positive = "pulsar"
+)
+
+roc_rf_cv <- roc(
+  response = rf_cv_pred$obs,
+  predictor = rf_cv_pred$pulsar,
+  levels = c("non_pulsar", "pulsar"),
+  direction = "<",
+  quiet = TRUE
+)
+
+pr_rf_cv <- pr.curve(
+  scores.class0 =
+    rf_cv_pred$pulsar[rf_cv_pred$obs == "pulsar"],
+  scores.class1 =
+    rf_cv_pred$pulsar[rf_cv_pred$obs == "non_pulsar"],
+  curve = TRUE
+)
+
+rf_results <- data.frame(
+  Sensitivity = cm_rf_cv$byClass["Sensitivity"],
+  FPR = 1 - cm_rf_cv$byClass["Specificity"],
+  Precision = cm_rf_cv$byClass["Pos Pred Value"],
+  ROC_AUC = as.numeric(auc(roc_rf_cv)),
+  PR_AUC = pr_rf_cv$auc.integral
+)
+
+```
+
+
+```{r rf-results-table, echo=FALSE}
+rf_table <- data.frame(
+  Metric = c(
+    "Sensitivity",
+    "FPR",
+    "Precision",
+    "ROC-AUC",
+    "PR-AUC"
+  ),
+  Value = round(as.numeric(rf_results[1, ]), 4)
+)
+
+knitr::kable(
+  rf_table,
+  row.names = FALSE,
+  caption = paste0(
+    "Random Forest (mtry = ",
+    selected_mtry,
+    ") out-of-fold performance"
+  )
+)
+```
+
+Random Forest achieves a Sensitivity of 0.8468 while maintaining a low FPR of 0.0065 and a high Precision of 0.9289. Its ROC-AUC of 0.9751 and PR-AUC of 0.9296 indicate very strong ranking performance, among the strongest observed so far in the internal cross-validated analysis. Compared with Bagging, Random Forest yields a modest improvement in Sensitivity and ranking quality while preserving a similarly low false-positive rate and high Precision. This suggests that introducing random feature selection through the tuned \(mtry\) parameter provides an additional gain beyond bootstrap aggregation alone.
+
+
+```{r rf-final-model, fig.width=8, fig.height=6}
+
+# Numeric variable-importance measures
+importance(
+  rf_model$finalModel
+)
+
+varImpPlot(
+  rf_model$finalModel,
+  main = "Variable Importance - Random Forest"
+)
+```
+
+Random Forest also assigns the largest importance to `profile_kurtosis`, with `profile_skewness` and other DM-SNR measures contributing secondarily. This broadly agrees with the structure observed in the Classification Tree.
+
+## 5.7 Gradient Boosting
+
+Gradient Boosting sequentially combines weak decision trees, with each new tree correcting residual structure left by the previous ensemble. The tuning grid is designed around small learning rates. A shrinkage value of 0.01 is paired with 3,000--5,000 trees, while the smaller value 0.001 is paired with 10,000--30,000 trees. Interaction depths from 1 to 3 are considered and the minimum terminal-node size is fixed at 10.
+
+The grid contains 18 configurations and is evaluated by 10-fold cross-validated PR-AUC.
+
+
+```{r boosting-tuning, fig.width=10, fig.height=6, cache=TRUE}
+train_boost <- train_data
+
+train_boost$class <- relevel(
+  train_boost$class,
+  ref = "pulsar"
+)
+
+# Final grid: small learning rates with more trees
+boost_grid <- rbind(
+  expand.grid(
+    n.trees = c(3000, 4000, 5000),
+    interaction.depth = c(1, 2, 3),
+    shrinkage = 0.01,
+    n.minobsinnode = 10
+  ),
+  expand.grid(
+    n.trees = c(10000, 20000, 30000),
+    interaction.depth = c(1, 2, 3),
+    shrinkage = 0.001,
+    n.minobsinnode = 10
+  )
+)
+
+set.seed(123)
+
+boost_model <- train(
+  class ~ .,
+  data = train_boost,
+  method = "gbm",
+  tuneGrid = boost_grid,
+  trControl = cv_control_multi,
+  metric = "PR_AUC",
+  maximize = TRUE,
+  verbose = FALSE
+)
+
+plot(boost_model)
+
+# Full cross-validated tuning results
+boost_model$results
+
+best_boost <- boost_model$bestTune
+best_boost
+```
+
+
+The highest cross-validated PR-AUC is approximately **0.9344**, obtained with
+
+$$
+n.trees=30000, \quad interaction.depth=3, \quad shrinkage=0.001, \quad n.minobsinnode=10.
+$$
+
+Several configurations with depth 2 or 3 achieve very similar PR-AUC values, indicating a relatively flat high-performance region. In particular, the difference between the selected configuration and the best configurations with shrinkage 0.01 is small relative to the between-fold variability. The selected configuration is therefore the empirical maximum of the defined grid rather than evidence of a large performance gap.
+
+
+```{r boosting-performance}
+boost_cv_pred <- data.frame(
+  obs = boost_model$pred$obs,
+  pred = boost_model$pred$pred,
+  pulsar = boost_model$pred$pulsar
+)
+
+cm_boost_cv <- confusionMatrix(
+  data = boost_cv_pred$pred,
+  reference = boost_cv_pred$obs,
+  positive = "pulsar"
+)
+
+roc_boost_cv <- roc(
+  response = boost_cv_pred$obs,
+  predictor = boost_cv_pred$pulsar,
+  levels = c("non_pulsar", "pulsar"),
+  direction = "<",
+  quiet = TRUE
+)
+
+pr_boost_cv <- pr.curve(
+  scores.class0 =
+    boost_cv_pred$pulsar[boost_cv_pred$obs == "pulsar"],
+  scores.class1 =
+    boost_cv_pred$pulsar[boost_cv_pred$obs == "non_pulsar"],
+  curve = TRUE
+)
+
+boost_results <- data.frame(
+  Sensitivity = cm_boost_cv$byClass["Sensitivity"],
+  FPR = 1 - cm_boost_cv$byClass["Specificity"],
+  Precision = cm_boost_cv$byClass["Pos Pred Value"],
+  ROC_AUC = as.numeric(auc(roc_boost_cv)),
+  PR_AUC = pr_boost_cv$auc.integral
+)
+```
+
+```{r boosting-results-table, echo=FALSE}
+boost_table <- data.frame(
+  Metric = c(
+    "Sensitivity",
+    "FPR",
+    "Precision",
+    "ROC-AUC",
+    "PR-AUC"
+  ),
+  Value = round(as.numeric(boost_results[1, ]), 4)
+)
+
+knitr::kable(
+  boost_table,
+  row.names = FALSE,
+  caption = "Gradient Boosting out-of-fold performance"
+)
+```
+
+The selected Gradient Boosting model achieves a Sensitivity of 0.8476 while maintaining a very low FPR of 0.0061 and a high Precision of 0.9337. Its ROC-AUC of 0.9786 and PR-AUC of 0.9333 indicate very strong ranking performance. Compared with Bagging and Random Forest, Gradient Boosting provides a modest improvement in both ranking metrics while preserving a similar balance between Sensitivity and false-positive control.
+
+This suggests that the sequential correction of prediction errors allows the model to capture additional structure in the data beyond that exploited by the parallel tree ensembles. However, the differences in cross-validated performance are relatively small and should not be interpreted as evidence of a substantial superiority over the other ensemble methods.
+
+
+
+
+```{r boosting-final-model, fig.width=8, fig.height=6}
+
+boost_importance <- varImp(
+  boost_model
+)
+
+plot(
+  boost_importance,
+  main = "Variable Importance - Gradient Boosting"
+)
+```
+
+
+The Boosting variable-importance measure is strongly dominated by `profile_kurtosis`, which is normalized to 100. The next most important predictors have much smaller relative importance values. The value 100 should be interpreted as a relative normalization, not as 100% of the total predictive information.
+
+# 6. Decision Threshold Strategy
+
+The model-selection criterion and the final classification threshold address different questions. PR-AUC is used to select model hyperparameters because it measures overall positive-class ranking quality across thresholds. After model development, a single operating threshold is selected separately for each model.
+
+The threshold rule is
+
+$$
+\max_t Specificity(t) \quad \text{subject to} \quad Sensitivity(t) \ge 0.90,
+$$
+
+or equivalently
+
+$$
+\min_t FPR(t) \quad \text{subject to} \quad Sensitivity(t) \ge 0.90.
+$$
+
+The 90% Sensitivity level is a predefined operational target rather than a quantity estimated from the dataset. The motivation is that the classification problem is treated as a screening task, in which failing to identify a genuine pulsar is considered more costly than sending an additional non-pulsar candidate to further inspection. 
+
+For this reason, the operating threshold is not chosen to maximize overall accuracy or to retain the default probability cutoff of 0.5. 
+
+Instead, a minimum Sensitivity requirement is imposed first, ensuring that the classifier detects approximately nine out of ten pulsars in the cross-validated training predictions. Among all thresholds satisfying this requirement, the threshold with the highest Specificity is selected, equivalently the one with the lowest false-positive rate.
+
+The 90% value should therefore be interpreted as an operational compromise rather than as a statistically optimal or universally valid cutoff.
+A higher target, such as 95%, would prioritize the recovery of additional pulsars but would generally increase the number of false positives, whereas a lower target would reduce the screening burden at the cost of missing more true pulsars. 
+
+The selected threshold consequently represents one specific point on the trade-off between detection and false-positive control. Importantly, threshold selection is performed exclusively from out-of-fold predictions on the training data and is then frozen before evaluating the models on the independent test set.
+
+
+
+```{r adjusted-threshold-selection}
+select_adjusted_threshold <- function(roc_object) {
+  
+  thresholds <- coords(
+    roc_object,
+    x = "all",
+    ret = c(
+      "threshold",
+      "sensitivity",
+      "specificity"
+    ),
+    transpose = FALSE
+  )
+  
+  candidates <- thresholds[
+    thresholds$sensitivity >= 0.90 &
+      is.finite(thresholds$threshold),
+  ]
+  
+  if (nrow(candidates) == 0) {
+    stop("No finite threshold achieves Sensitivity >= 0.90.")
+  }
+  
+  max_specificity <- max(
+    candidates$specificity
+  )
+  
+  candidates <- candidates[
+    candidates$specificity == max_specificity,
+  ]
+  
+  operating_point <- candidates[
+    which.max(candidates$threshold),
+  ]
+  
+  operating_point$FPR <-
+    1 - operating_point$specificity
+  
+  operating_point
+}
+
+
+lda_operating_point <-
+  select_adjusted_threshold(roc_lda_cv)
+
+qda_operating_point <-
+  select_adjusted_threshold(roc_qda_cv)
+
+knn_operating_point <-
+  select_adjusted_threshold(roc_knn_cv)
+
+tree_operating_point <-
+  select_adjusted_threshold(roc_tree_cv)
+
+bag_operating_point <-
+  select_adjusted_threshold(roc_bag_cv)
+
+rf_operating_point <-
+  select_adjusted_threshold(roc_rf_cv)
+
+boost_operating_point <-
+  select_adjusted_threshold(roc_boost_cv)
+
+
+lda_threshold <- lda_operating_point$threshold
+qda_threshold <- qda_operating_point$threshold
+knn_threshold <- knn_operating_point$threshold
+tree_threshold <- tree_operating_point$threshold
+bag_threshold <- bag_operating_point$threshold
+rf_threshold <- rf_operating_point$threshold
+boost_threshold <- boost_operating_point$threshold
+```
+
+
+The selected operating points are summarized below.
+
+
+```{r adjusted-threshold-table, echo=TRUE}
+adjusted_thresholds <- data.frame(
+  Model = c(
+    "LDA",
+    "QDA",
+    "KNN",
+    "Classification Tree",
+    "Bagging",
+    "Random Forest",
+    "Gradient Boosting"
+  ),
+  
+  Threshold = c(
+    lda_threshold,
+    qda_threshold,
+    knn_threshold,
+    tree_threshold,
+    bag_threshold,
+    rf_threshold,
+    boost_threshold
+  ),
+  
+  Sensitivity = c(
+    lda_operating_point$sensitivity,
+    qda_operating_point$sensitivity,
+    knn_operating_point$sensitivity,
+    tree_operating_point$sensitivity,
+    bag_operating_point$sensitivity,
+    rf_operating_point$sensitivity,
+    boost_operating_point$sensitivity
+  ),
+  
+  FPR = c(
+    lda_operating_point$FPR,
+    qda_operating_point$FPR,
+    knn_operating_point$FPR,
+    tree_operating_point$FPR,
+    bag_operating_point$FPR,
+    rf_operating_point$FPR,
+    boost_operating_point$FPR
+  )
+)
+
+adjusted_thresholds_round <- adjusted_thresholds
+
+adjusted_thresholds_round[, -1] <-
+  round(
+    adjusted_thresholds_round[, -1],
+    4
+  )
+
+adjusted_thresholds_round
+```
+
+
+The threshold values differ substantially across models because their probability or score scales are not directly comparable. The threshold itself is therefore not a measure of model quality. What matters is the operating point it induces in terms of Sensitivity, Specificity/FPR and Precision.
+
+The 90% constraint is enforced only on the OOF training predictions used for threshold selection. Consequently, test-set Sensitivity is not required to remain at or above 90%; deviations on new observations are part of the independent generalization assessment.
+
+# 7. Final Test-Set Evaluation
+The models and their decision thresholds are now evaluated on the independent test set, which has remained completely untouched during model development, hyperparameter tuning, and threshold selection. This final evaluation therefore provides an external assessment of generalization performance. Results are reported first under the standard classification rule and then under the model-specific thresholds selected from out-of-fold training predictions.
+
+The following evaluation function computes standard hard-classification metrics, ROC-AUC and PR-AUC from predicted probabilities, and threshold-adjusted metrics using the frozen model-specific threshold.
+
+
+```{r test-evaluation-function}
+evaluate_test_model <- function(
+    model_name,
+    obs,
+    pred_standard,
+    prob_pulsar,
+    adjusted_threshold
+) {
+  
+  pred_standard <- factor(
+    pred_standard,
+    levels = levels(obs)
+  )
+  
+  cm_standard <- confusionMatrix(
+    data = pred_standard,
+    reference = obs,
+    positive = "pulsar"
+  )
+  
+  sensitivity_standard <-
+    as.numeric(cm_standard$byClass["Sensitivity"])
+  
+  specificity_standard <-
+    as.numeric(cm_standard$byClass["Specificity"])
+  
+  fpr_standard <-
+    1 - specificity_standard
+  
+  precision_standard <-
+    as.numeric(cm_standard$byClass["Pos Pred Value"])
+  
+  
+  roc_object <- roc(
+    response = obs,
+    predictor = prob_pulsar,
+    levels = c("non_pulsar", "pulsar"),
+    direction = "<",
+    quiet = TRUE
+  )
+  
+  roc_auc <- as.numeric(
+    auc(roc_object)
+  )
+  
+  
+  pr_object <- pr.curve(
+    scores.class0 =
+      prob_pulsar[obs == "pulsar"],
+    
+    scores.class1 =
+      prob_pulsar[obs == "non_pulsar"],
+    
+    curve = TRUE
+  )
+  
+  pr_auc <- pr_object$auc.integral
+  
+  
+  pred_adjusted <- factor(
+    ifelse(
+      prob_pulsar >= adjusted_threshold,
+      "pulsar",
+      "non_pulsar"
+    ),
+    levels = levels(obs)
+  )
+  
+  cm_adjusted <- confusionMatrix(
+    data = pred_adjusted,
+    reference = obs,
+    positive = "pulsar"
+  )
+  
+  sensitivity_adjusted <-
+    as.numeric(cm_adjusted$byClass["Sensitivity"])
+  
+  specificity_adjusted <-
+    as.numeric(cm_adjusted$byClass["Specificity"])
+  
+  fpr_adjusted <-
+    1 - specificity_adjusted
+  
+  precision_adjusted <-
+    as.numeric(cm_adjusted$byClass["Pos Pred Value"])
+  
+  
+  FP_adjusted <- as.numeric(
+    cm_adjusted$table[
+      "pulsar",
+      "non_pulsar"
+    ]
+  )
+  
+  FN_adjusted <- as.numeric(
+    cm_adjusted$table[
+      "non_pulsar",
+      "pulsar"
+    ]
+  )
+  
+  
+  results <- data.frame(
+    Model = model_name,
+    Sensitivity_Standard = sensitivity_standard,
+    FPR_Standard = fpr_standard,
+    Precision_Standard = precision_standard,
+    ROC_AUC = roc_auc,
+    PR_AUC = pr_auc,
+    Threshold = adjusted_threshold,
+    Sensitivity_adjusted = sensitivity_adjusted,
+    FPR_adjusted = fpr_adjusted,
+    Precision_adjusted = precision_adjusted,
+    FP_adjusted = FP_adjusted,
+    FN_adjusted = FN_adjusted
+  )
+  
+  
+  return(
+    list(
+      results = results,
+      cm_standard = cm_standard,
+      cm_adjusted = cm_adjusted,
+      roc = roc_object,
+      pr = pr_object
+    )
+  )
+}
+```
+
+
+The final test predictions are then generated for all seven models. `caret` models automatically use their selected tuning parameters and the preprocessing learned from the training data. The Classification Tree and Bagging use the package-specific prediction interfaces.
+
+
+```{r test-predictions}
+# LDA
+lda_test_pred <- predict(
+  lda_model,
+  newdata = test_data,
+  type = "raw"
+)
+
+lda_test_prob <- predict(
+  lda_model,
+  newdata = test_data,
+  type = "prob"
+)[, "pulsar"]
+
+test_lda <- evaluate_test_model(
+  model_name = "LDA",
+  obs = test_data$class,
+  pred_standard = lda_test_pred,
+  prob_pulsar = lda_test_prob,
+  adjusted_threshold = lda_threshold
+)
+
+
+# QDA
+qda_test_pred <- predict(
+  qda_model,
+  newdata = test_data,
+  type = "raw"
+)
+
+qda_test_prob <- predict(
+  qda_model,
+  newdata = test_data,
+  type = "prob"
+)[, "pulsar"]
+
+test_qda <- evaluate_test_model(
+  model_name = "QDA",
+  obs = test_data$class,
+  pred_standard = qda_test_pred,
+  prob_pulsar = qda_test_prob,
+  adjusted_threshold = qda_threshold
+)
+
+
+# KNN
+knn_test_pred <- predict(
+  knn_tuning,
+  newdata = test_data,
+  type = "raw"
+)
+
+knn_test_prob <- predict(
+  knn_tuning,
+  newdata = test_data,
+  type = "prob"
+)[, "pulsar"]
+
+test_knn <- evaluate_test_model(
+  model_name = paste0(
+    "KNN (k = ",
+    selected_k,
+    ")"
+  ),
+  obs = test_data$class,
+  pred_standard = knn_test_pred,
+  prob_pulsar = knn_test_prob,
+  adjusted_threshold = knn_threshold
+)
+
+
+# Classification Tree
+tree_test_pred <- predict(
+  tree_final,
+  newdata = test_data,
+  type = "class"
+)
+
+tree_test_prob <- predict(
+  tree_final,
+  newdata = test_data,
+  type = "vector"
+)[, "pulsar"]
+
+test_tree <- evaluate_test_model(
+  model_name = "Classification Tree",
+  obs = test_data$class,
+  pred_standard = tree_test_pred,
+  prob_pulsar = tree_test_prob,
+  adjusted_threshold = tree_threshold
+)
+
+# Bagging
+bag_test_pred <- predict(
+  bag_model,
+  newdata = test_data,
+  type = "response"
+)
+
+bag_test_prob <- predict(
+  bag_model,
+  newdata = test_data,
+  type = "prob"
+)[, "pulsar"]
+
+test_bag <- evaluate_test_model(
+  model_name = "Bagging",
+  obs = test_data$class,
+  pred_standard = bag_test_pred,
+  prob_pulsar = bag_test_prob,
+  adjusted_threshold = bag_threshold
+)
+
+
+# Random Forest
+rf_test_pred <- predict(
+  rf_model,
+  newdata = test_data,
+  type = "raw"
+)
+
+rf_test_prob <- predict(
+  rf_model,
+  newdata = test_data,
+  type = "prob"
+)[, "pulsar"]
+
+test_rf <- evaluate_test_model(
+  model_name = "Random Forest",
+  obs = test_data$class,
+  pred_standard = rf_test_pred,
+  prob_pulsar = rf_test_prob,
+  adjusted_threshold = rf_threshold
+)
+
+
+# Gradient Boosting
+boost_test_pred <- predict(
+  boost_model,
+  newdata = test_data,
+  type = "raw"
+)
+
+boost_test_prob <- predict(
+  boost_model,
+  newdata = test_data,
+  type = "prob"
+)[, "pulsar"]
+
+test_boost <- evaluate_test_model(
+  model_name = "Gradient Boosting",
+  obs = test_data$class,
+  pred_standard = boost_test_pred,
+  prob_pulsar = boost_test_prob,
+  adjusted_threshold = boost_threshold
+)
+```
+
+
+The model-specific result rows are combined into a single comparison object.
+
+
+```{r final-comparison-data}
+test_model_comparison <- rbind(
+  test_lda$results,
+  test_qda$results,
+  test_knn$results,
+  test_tree$results,
+  test_bag$results,
+  test_rf$results,
+  test_boost$results
+)
+
+test_model_comparison_round <- test_model_comparison
+
+numeric_columns <- sapply(
+  test_model_comparison_round,
+  is.numeric
+)
+
+test_model_comparison_round[numeric_columns] <- round(
+  test_model_comparison_round[numeric_columns],
+  4
+)
+```
+
+
+## 7.1 Final Test-Set Results
+
+### Standard classification rule
+
+
+```{r standard-performance-table, echo=FALSE}
+standard_results <- test_model_comparison_round[
+  ,
+  c(
+    "Model",
+    "Sensitivity_Standard",
+    "FPR_Standard",
+    "Precision_Standard",
+    "ROC_AUC",
+    "PR_AUC"
+  )
+]
+
+names(standard_results) <- c(
+  "Model",
+  "Sensitivity",
+  "FPR",
+  "Precision",
+  "ROC-AUC",
+  "PR-AUC"
+)
+
+knitr::kable(
+  standard_results,
+  align = c("l", "c", "c", "c", "c", "c"),
+  caption = "Final test-set performance under the standard classification rule"
+)
+```
+
+The standard-rule results reveal an important distinction between hard classification and ranking quality. Gradient Boosting achieves the highest observed test ROC-AUC (0.9766) and PR-AUC (0.9153) among the considered models. LDA and Random Forest are very close in PR-AUC (0.9127 and 0.9126, respectively), showing that a comparatively simple linear classifier remains highly competitive in terms of ranking performance.
+
+LDA is particularly conservative under its standard rule: its Sensitivity is only 0.7706, but its FPR is 0.0043 and its Precision is 0.9474. KNN shows a similar pattern, with high Precision (0.9395) and a low FPR (0.0052), but lower Sensitivity than Bagging, Random Forest and Gradient Boosting. QDA attains higher Sensitivity (0.8563) but at a much larger FPR (0.0246) and lower Precision (0.7778). The single Classification Tree has the lowest observed PR-AUC (0.8740), while Bagging, Random Forest and Gradient Boosting all provide strong standard-rule performance.
+
+### Adjusted classification rule
+
+```{r adjusted-performance-table, echo=FALSE}
+adjusted_results <- test_model_comparison_round[
+  ,
+  c(
+    "Model",
+    "Threshold",
+    "Sensitivity_adjusted",
+    "FPR_adjusted",
+    "Precision_adjusted",
+    "FP_adjusted",
+    "FN_adjusted"
+  )
+]
+
+names(adjusted_results) <- c(
+  "Model",
+  "Threshold",
+  "Sensitivity",
+  "FPR",
+  "Precision",
+  "FP",
+  "FN"
+)
+
+knitr::kable(
+  adjusted_results,
+  align = c("l", "c", "c", "c", "c", "c", "c"),
+  caption = "Final test-set performance at thresholds selected from out-of-fold training predictions"
+)
+```
+Applying the adjusted thresholds increases Sensitivity for every model relative to its standard classification rule, as intended. This gain is accompanied by higher FPR and lower Precision, illustrating the expected trade-off produced by lowering the decision threshold to prioritize pulsar detection.
+
+KNN reaches the highest adjusted test Sensitivity (0.8991), followed closely by LDA (0.8960) and QDA (0.8930). However, these similar Sensitivity values are achieved at substantially different false-positive costs. LDA has an FPR of 0.0188 and Precision of 0.8277, whereas QDA has an FPR of 0.0498 and Precision of 0.6432. QDA therefore generates substantially more false-positive candidates while detecting a similar proportion of pulsars.
+
+Random Forest achieves a Sensitivity of 0.8869 with an FPR of 0.0169 and Precision of 0.8406. Gradient Boosting reaches a somewhat lower Sensitivity of 0.8746 but has the lowest adjusted FPR (0.0123) and the highest adjusted Precision (0.8773). In absolute terms, Gradient Boosting produces 40 false positives and 41 false negatives, whereas Random Forest produces 55 false positives and 37 false negatives. This comparison makes the operating trade-off explicit: Random Forest recovers four additional pulsars at the cost of fifteen additional false positives.
+
+Bagging and the Classification Tree provide another useful comparison because both achieve an adjusted Sensitivity of 0.8838. Bagging has a lower FPR (0.0221 versus 0.0305) and consequently higher Precision (0.8006 versus 0.7448). Their false-negative counts are identical (38), but the Classification Tree produces 99 false positives compared with 72 for Bagging.
+
+None of the adjusted test Sensitivities reaches the 0.90 target. This does not indicate an inconsistency in the procedure: the 90% Sensitivity requirement was imposed only during threshold selection using OOF training predictions. Once selected, the thresholds were frozen and transferred unchanged to the independent test set, where their realized Sensitivity is allowed to differ. The test results therefore show how the selected operating points generalize to previously unseen observations.
+
+## 7.2 ROC Curves
+
+The ROC curves compare Sensitivity and FPR over all possible thresholds. They therefore evaluate the full ranking behavior of the test-set probability scores rather than the single adjusted operating point.
+
+
+```{r final-roc-curves, fig.width=10, fig.height=7}
+roc_colors <- c(
+  "steelblue",
+  "darkorange",
+  "forestgreen",
+  "purple",
+  "brown3",
+  "deepskyblue4",
+  "red3"
+)
+
+plot(
+  test_lda$roc,
+  legacy.axes = TRUE,
+  identity = TRUE,
+  xlim = c(1, 0),
+  ylim = c(0, 1),
+  xaxs = "i",
+  yaxs = "i",
+  asp = NA,
+  col = roc_colors[1],
+  lwd = 2,
+  main = "ROC Curves - Final Test Set"
+)
+
+plot(
+  test_qda$roc,
+  add = TRUE,
+  col = roc_colors[2],
+  lwd = 2
+)
+
+plot(
+  test_knn$roc,
+  add = TRUE,
+  col = roc_colors[3],
+  lwd = 2
+)
+
+plot(
+  test_tree$roc,
+  add = TRUE,
+  col = roc_colors[4],
+  lwd = 2
+)
+
+plot(
+  test_bag$roc,
+  add = TRUE,
+  col = roc_colors[5],
+  lwd = 2
+)
+
+plot(
+  test_rf$roc,
+  add = TRUE,
+  col = roc_colors[6],
+  lwd = 2
+)
+
+plot(
+  test_boost$roc,
+  add = TRUE,
+  col = roc_colors[7],
+  lwd = 2
+)
+
+legend(
+  "bottomright",
+  legend = c(
+    "LDA",
+    "QDA",
+    "KNN",
+    "Classification Tree",
+    "Bagging",
+    "Random Forest",
+    "Gradient Boosting"
+  ),
+  col = roc_colors,
+  lwd = 2,
+  cex = 0.8,
+  bty = "n"
+)
+```
+
+
+The ROC curves show strong discrimination across all models, with the curves concentrated near the upper-left corner and well above the diagonal reference line. 
+
+Gradient Boosting achieves the highest observed test ROC-AUC (0.9766), although several models exhibit broadly similar ROC behaviour over much of the false-positive-rate range. 
+LDA also performs particularly well despite the departures from its distributional assumptions observed during the exploratory analysis, confirming that these departures do not prevent effective class ranking in this dataset. 
+
+The substantial overlap among several curves also suggests that differences in ROC-AUC should not be interpreted as evidence of large performance gaps. 
+Finally, because pulsars represent a relatively rare positive class, ROC analysis is complemented by Precision-Recall curves, which provide a more direct view of the trade-off between recovering pulsars and maintaining reliable positive predictions.
+
+## 7.3 Precision-Recall Curves
+
+The Precision-Recall curves focus directly on the trade-off between detecting pulsars and maintaining reliable positive predictions. This representation is particularly informative for the imbalanced response.
+
+
+```{r final-pr-curves, fig.width=10, fig.height=7}
+pr_plot_data <- rbind(
+  
+  data.frame(
+    Recall = test_lda$pr$curve[, 1],
+    Precision = test_lda$pr$curve[, 2],
+    Model = "LDA"
+  ),
+  
+  data.frame(
+    Recall = test_qda$pr$curve[, 1],
+    Precision = test_qda$pr$curve[, 2],
+    Model = "QDA"
+  ),
+  
+  data.frame(
+    Recall = test_knn$pr$curve[, 1],
+    Precision = test_knn$pr$curve[, 2],
+    Model = "KNN"
+  ),
+  
+  data.frame(
+    Recall = test_tree$pr$curve[, 1],
+    Precision = test_tree$pr$curve[, 2],
+    Model = "Classification Tree"
+  ),
+  
+  data.frame(
+    Recall = test_bag$pr$curve[, 1],
+    Precision = test_bag$pr$curve[, 2],
+    Model = "Bagging"
+  ),
+  
+  data.frame(
+    Recall = test_rf$pr$curve[, 1],
+    Precision = test_rf$pr$curve[, 2],
+    Model = "Random Forest"
+  ),
+  
+  data.frame(
+    Recall = test_boost$pr$curve[, 1],
+    Precision = test_boost$pr$curve[, 2],
+    Model = "Gradient Boosting"
+  )
+)
+
+ggplot(
+  pr_plot_data,
+  aes(
+    x = Recall,
+    y = Precision,
+    colour = Model
+  )
+) +
+  geom_line(
+    linewidth = 0.8
+  ) +
+  labs(
+    title = "Precision-Recall Curves - Final Test Set",
+    x = "Recall (Sensitivity)",
+    y = "Precision",
+    colour = "Model"
+  ) +
+  theme_classic()
+```
+
+The Precision-Recall curves provide a more direct view of performance on the minority pulsar class by showing the trade-off between Recall and the reliability of positive predictions. Gradient Boosting achieves the highest observed test PR-AUC (0.9153), while LDA (0.9127) and Random Forest (0.9126) obtain very similar values. The substantial overlap among several curves indicates that the differences in overall ranking performance are relatively small, whereas the Classification Tree shows weaker Precision-Recall behaviour, consistent with its lower PR-AUC.
+
+A distinctive feature of the Gradient Boosting curve appears at very low Recall, where Precision briefly drops before rapidly recovering. Inspection of the ranked predictions shows that this behaviour is caused by a single non-pulsar observation receiving an extremely high predicted pulsar probability: after the first five correctly ranked pulsars, this false positive causes Precision to fall from 1 to 0.8333 without increasing Recall. As additional true pulsars enter the ranked set, Precision quickly rises again. This local irregularity has only a limited effect on the overall PR-AUC, but it illustrates how the full Precision-Recall curve can reveal ranking behaviour that would be hidden by a single summary metric.
+
+
+## 7.4 Threshold-Adjusted Operating Points
+
+
+
+The ROC and Precision-Recall curves describe model performance across the full range of possible decision thresholds. The following plot instead focuses on the single operating point selected for each model using the OOF training predictions and then transferred unchanged to the independent test set.
+
+Each point therefore represents the realized test-set combination of Sensitivity and false-positive rate obtained at the corresponding frozen model-specific threshold. 
+
+In this final plot, desirable operating points lie toward the upper-left region, combining high pulsar detection with a low false-positive rate. The horizontal line at Sensitivity = 0.90 represents the operational target used during threshold selection on the training data. It is included only as a reference and is not a constraint that the independent test-set results are required to satisfy.
+
+
+```{r final-adjusted-performance, fig.width=10, fig.height=7}
+adjusted_plot_data <- test_model_comparison
+
+ggplot(
+  adjusted_plot_data,
+  aes(
+    x = FPR_adjusted,
+    y = Sensitivity_adjusted,
+    label = Model
+  )
+) +
+  geom_point(
+    size = 3
+  ) +
+  geom_text(
+    nudge_y = 0.0025,
+    size = 3.2
+  ) +
+  geom_hline(
+    yintercept = 0.90,
+    linetype = "dashed"
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = c(0.15, 0.15))
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.08, 0.08))
+  ) +
+  labs(
+    title = "Threshold-Adjusted Performance - Final Test Set",
+    subtitle =
+      "Thresholds selected from cross-validated training predictions",
+    x = "False Positive Rate",
+    y = "Sensitivity (Recall)"
+  ) +
+  theme_classic()
+```
+
+
+The adjusted operating points make the trade-off between pulsar detection and false-positive control particularly clear. None of the test-set points reaches the 0.90 Sensitivity reference line, which is consistent with the fact that the target was imposed only during threshold selection on OOF training predictions and was not enforced on the independent test set.
+
+KNN lies closest to the 0.90 target, with a Sensitivity of 0.8991, but this is accompanied by a higher FPR of 0.0234. LDA reaches a similarly high Sensitivity of 0.8960 with a somewhat lower FPR of 0.0188, whereas QDA achieves comparable Sensitivity at a substantially larger false-positive cost. Gradient Boosting occupies the leftmost region of the plot, reflecting the lowest adjusted FPR (0.0123), but this stronger false-positive control is obtained at a lower Sensitivity of 0.8746. Random Forest provides an intermediate operating point, with Sensitivity of 0.8869 and FPR of 0.0169.
+
+The comparison between Bagging and the Classification Tree is also informative: both achieve the same test Sensitivity of 0.8838, but Bagging lies further to the left because of its lower FPR. Overall, the plot confirms that threshold adjustment does not produce a single uniformly preferable operating point. Instead, the models occupy different positions along the trade-off between recovering additional pulsars and limiting the number of false-positive candidates.
+
+# 8. Conclusions
+
+This project compared seven supervised classification methods for pulsar identification in the imbalanced HTRU2 dataset, with model development and threshold selection kept separate from final evaluation on an untouched test set.
+
+The results show that model complexity does not automatically translate into substantially better ranking performance. Gradient Boosting achieves the highest observed test ROC-AUC (0.9766) and PR-AUC (0.9153), but LDA and Random Forest are very close in PR-AUC (0.9127 and 0.9126, respectively). In particular, the strong performance of LDA shows that a comparatively simple linear classifier can remain highly competitive even when exploratory analysis suggests departures from its ideal assumptions.
+
+A second important result is the distinction between ranking quality and operating-point performance. Under the standard classification rule, models such as LDA and KNN behave conservatively, with very low false-positive rates and high Precision but lower Sensitivity. Once the decision threshold is adjusted to prioritize pulsar detection, Sensitivity increases for every model, at the expected cost of higher FPR and lower Precision.
+
+The adjusted test results reveal different operational trade-offs rather than a single universally preferable solution. KNN comes closest to the predefined 90% Sensitivity target, while Gradient Boosting achieves the lowest adjusted FPR and the highest adjusted Precision but at a lower Sensitivity. Random Forest lies between these extremes and provides a comparatively balanced operating point. QDA achieves relatively high Sensitivity only with a substantially larger false-positive burden, while the single Classification Tree shows weaker ranking performance and a less favorable trade-off than Bagging at comparable Sensitivity.
+
+The predictor analyses also show a consistent pattern across models. profile_kurtosis plays a central role in the Classification Tree and is the dominant variable in Gradient Boosting, while DM-SNR-derived variables provide additional predictive information. This suggests that both pulse-profile morphology and dispersion-related signal characteristics contribute to distinguishing pulsars from non-pulsars, although these associations should be interpreted as predictive rather than causal.
+
+Overall, the analysis highlights that model selection, ranking performance and threshold selection address different aspects of the classification problem. PR-AUC is useful for comparing how well models rank rare pulsar candidates, while the final threshold determines the practical balance between missed pulsars and false-positive candidates. 
+Possible extensions could focus on the operating-point definition, for example by evaluating alternative Sensitivity targets and by explicitly incorporating asymmetric misclassification costs. This would allow threshold selection to reflect more directly the relative cost of missing a genuine pulsar compared with the cost of sending additional false-positive candidates to further inspection.
+
+# References
+
+Lyon, R. J. (2015).  
+*HTRU2* [Dataset]. UCI Machine Learning Repository.  
+https://doi.org/10.24432/C5DK6R
+
+Lyon, R. J., Stappers, B. W., Cooper, S., Brooke, J. M., & Knowles, J. D. (2016).  
+Fifty years of pulsar candidate selection: From simple filters to a new principled real-time classification approach.  
+*Monthly Notices of the Royal Astronomical Society, 459*(1), 1104–1123.  
+https://doi.org/10.1093/mnras/stw656
+
+
